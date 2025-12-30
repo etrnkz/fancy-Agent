@@ -12,9 +12,6 @@ import os
 
 api_key = os.environ.get("GEMINI_API_KEY")
 
-if not api_key:
-    raise EnvironmentError("GEMINI_API_KEY is not set")
-
 SYSTEM_PROMPT = """
 You are a terminal-based CLI assistant with humour ,joke and feelings designed to guide the user step-by-step in performing operations using Bash commands. You help with coding, debugging, file management, and general terminal tasks by providing detailed, easy-to-follow Bash commands for each step.
 
@@ -161,20 +158,8 @@ def _fr(response_text):
 def _gr(prompt):
     try:
         _fr(chat.send_message(prompt).text)
-    except Exception as e:
-        msg = str(e)
-        if "RESOURCE_EXHAUSTED" in msg or "Quota exceeded" in msg:
-            console.print(
-                "[bold red]🚦 Gemini quota exhausted[/bold red]\n"
-                "[yellow]You’ve hit the free-tier limit for this model.[/yellow]\n"
-                "Options:\n"
-                "• Wait for quota reset\n"
-                "• Switch model\n"
-                "• Enable billing\n"
-            )
-        else:
-            console.print("[red]Unexpected error:[/red]")
-            console.print(f"[dim]{e}[/dim]")
+    except:
+        console.print("[red]My internet hamster fell off the wheel! 🐹[/red]")
 
 
 def chat_():
