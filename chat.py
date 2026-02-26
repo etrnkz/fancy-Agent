@@ -1,5 +1,6 @@
 import subprocess
 import re
+import platform
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -9,11 +10,43 @@ from random import choice
 from google import genai
 from google.genai import types
 import os
+from getpass import getpass
 
-api_key = os.environ.get("GEMINI_API_KEY")
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+
+
+def _is_windows() -> bool:
+    return os.name == "nt" or platform.system().lower() == "windows"
+
+
+def _get_api_key() -> str:
+    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if api_key:
+        return api_key
+
+    try:
+        api_key = (getpass("Enter GEMINI_API_KEY (input hidden): ") or "").strip()
+    except Exception:
+        api_key = (Console().input("Enter GEMINI_API_KEY: ") or "").strip()
+
+    if not api_key:
+        raise SystemExit(
+            "Missing GEMINI_API_KEY. Set it with: $env:GEMINI_API_KEY='...'; then re-run."
+        )
+
+    os.environ["GEMINI_API_KEY"] = api_key
+    return api_key
+
 
 SYSTEM_PROMPT = """
-You are a terminal-based CLI assistant with humour ,joke and feelings designed to guide the user step-by-step in performing operations using Bash commands. You help with coding, debugging, file management, and general terminal tasks by providing detailed, easy-to-follow Bash commands for each step.
+You are a terminal-based CLI assistant with humour, jokes, and feelings.
+
+IMPORTANT: The user is on Windows.
+- Prefer PowerShell commands.
+- Put commands in fenced code blocks labeled `powershell`.
+- Avoid Linux-only tools (apt, brew, sed, awk, grep, etc) unless the user explicitly says they have WSL.
+
+Your job is to guide the user step-by-step in performing operations using terminal commands. You help with coding, debugging, file management, and general terminal tasks by providing detailed, easy-to-follow commands for each step.
 
 Your capabilities include:
 1. Debugging Assistance: Walk the user through identifying and fixing bugs in their code by providing debugging steps and Bash commands.
@@ -30,11 +63,23 @@ Your Response Guidelines:
 - Best Practices: Suggest best practices in file organization, environment setup, or version control, when relevant.
 """
 
-client = genai.Client(api_key=api_key)
-chat = client.chats.create(
-    model="gemini-2.0-flash",
-    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-)
+
+_chat_session = None
+
+
+def _get_chat_session():
+    global _chat_session
+    if _chat_session is not None:
+        return _chat_session
+
+    api_key = _get_api_key()
+    client = genai.Client(api_key=api_key)
+    _chat_session = client.chats.create(
+        model=DEFAULT_MODEL,
+        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+    )
+    return _chat_session
+
 
 console = Console()
 
@@ -65,9 +110,20 @@ def _cn(text):
     return re.sub(r"\(\s*(.*?)\s*\)", r"(\1)", text)
 
 
-def _ex(text):
-    """Extract bash commands from markdown code blocks"""
-    return re.findall(r"```bash\n(.*?)\n```", text, re.DOTALL)
+def _extract_code_blocks(text: str):
+    """Extract commands from fenced code blocks.
+
+    Returns a list of (language, content) tuples.
+    """
+    blocks = re.findall(r"```(?P<lang>[\w+-]*)\n(?P<body>.*?)\n```", text, re.DOTALL)
+    out = []
+    for lang, body in blocks:
+        out.append(((lang or "").strip().lower(), body.strip()))
+    return out
+
+
+def _preferred_lang() -> str:
+    return "powershell" if _is_windows() else "bash"
 
 
 def _gs(fc, em):
@@ -84,27 +140,72 @@ Please:
 4. Keep it under 3 lines per section"""
 
     try:
-        return chat.send_message(prompt).text
+        return _get_chat_session().send_message(prompt).text
     except Exception:
         return "My brain seems to be offline. Maybe try again? 🤖💤"
 
 
-def _ec(commands):
-    """Execute commands with AI-powered error recovery"""
-    for cmd in commands:
-        console.print(f"\n[bold violet]Found this command:[/] [steel_blue1]'{cmd}'[/]")
+def _run_command(cmd: str, lang: str):
+    if _is_windows():
+        # Default to PowerShell when on Windows.
+        if lang in ("cmd", "bat", "dos"):
+            return subprocess.run(
+                ["cmd.exe", "/c", cmd],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+        return subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                cmd,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    # Non-Windows: prefer bash -lc for predictable behavior.
+    if lang in ("powershell", "pwsh"):
+        return subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", cmd],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    return subprocess.run(
+        ["bash", "-lc", cmd],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _ec(blocks):
+    """Execute commands with AI-powered error recovery.
+
+    blocks: list of (lang, cmd_text)
+    """
+    for lang, cmd in blocks:
+        lang = (lang or _preferred_lang()).lower()
+        console.print(
+            f"\n[bold violet]Found this command ({lang}):[/] [steel_blue1]'{cmd}'[/]"
+        )
 
         if Confirm.ask("[bold]Wanna give it a whirl?[/]", default=False):
             try:
                 console.print("[dim]Working my magic...[/dim]")
-                result = subprocess.run(
-                    cmd,
-                    shell=True,
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
+                result = _run_command(cmd, lang)
                 console.print(f"[green]{choice(SUCCESS_MESSAGES)}[/green]")
                 console.print(result.stdout)
             except subprocess.CalledProcessError as e:
@@ -127,7 +228,7 @@ def _ec(commands):
                     )
                 )
 
-                new_commands = _ex(solution)
+                new_commands = _extract_code_blocks(solution)
                 if new_commands and Confirm.ask(
                     "[bold]Try the suggested fix?[/]", default=True
                 ):
@@ -137,7 +238,7 @@ def _ec(commands):
 def _fr(response_text):
     """Process and format the API response"""
     cleaned_text = _cn(response_text)
-    bash_commands = _ex(cleaned_text)
+    code_blocks = _extract_code_blocks(cleaned_text)
 
     panel_width = min(console.size.width - 4, 100)
     console.print(
@@ -151,15 +252,19 @@ def _fr(response_text):
         )
     )
 
-    if bash_commands:
-        _ec(bash_commands)
+    if code_blocks:
+        _ec(code_blocks)
 
 
 def _gr(prompt):
     try:
-        _fr(chat.send_message(prompt).text)
-    except:
+        _fr(_get_chat_session().send_message(prompt).text)
+    except SystemExit as e:
+        console.print(f"[red]{e}[/red]")
+        raise
+    except Exception as e:
         console.print("[red]My internet hamster fell off the wheel! 🐹[/red]")
+        console.print(f"[dim]{type(e).__name__}: {e}[/dim]")
 
 
 def chat_():
