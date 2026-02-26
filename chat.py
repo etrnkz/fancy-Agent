@@ -1,6 +1,7 @@
 import subprocess
 import re
 import platform
+import time
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -9,10 +10,25 @@ from rich.box import ROUNDED
 from random import choice
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 import os
 from getpass import getpass
 
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+
+
+def _parse_fallback_models() -> list[str]:
+    raw = (os.environ.get("GEMINI_MODEL_FALLBACKS") or "").strip()
+    if raw:
+        return [m.strip() for m in raw.split(",") if m.strip()]
+
+    # Conservative defaults; actual availability depends on your project/quota.
+    return [
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+    ]
 
 
 def _is_windows() -> bool:
@@ -64,21 +80,79 @@ Your Response Guidelines:
 """
 
 
+_client = None
 _chat_session = None
+_model_name = DEFAULT_MODEL
+_model_notice = None
+_last_fallback_attempts: list[str] = []
 
 
 def _get_chat_session():
-    global _chat_session
+    global _client, _chat_session
     if _chat_session is not None:
         return _chat_session
 
     api_key = _get_api_key()
-    client = genai.Client(api_key=api_key)
-    _chat_session = client.chats.create(
-        model=DEFAULT_MODEL,
+    if _client is None:
+        _client = genai.Client(api_key=api_key)
+
+    _chat_session = _client.chats.create(
+        model=_model_name,
         config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
     )
     return _chat_session
+
+
+def _reset_chat_session():
+    global _client, _chat_session
+    _chat_session = None
+    _client = None
+
+
+def _set_model_name(model_name: str, reason: str | None = None):
+    global _model_name, _model_notice
+    model_name = (model_name or "").strip()
+    if not model_name:
+        return
+    if model_name == _model_name:
+        return
+    _model_name = model_name
+    _model_notice = f"Switched model to '{_model_name}'" + (
+        f" ({reason})" if reason else ""
+    )
+
+
+def _send_message(text: str):
+    """Send a message with one automatic retry for closed-client errors."""
+    try:
+        return _get_chat_session().send_message(text)
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "client has been closed" in msg or "cannot send a request" in msg:
+            _reset_chat_session()
+            return _get_chat_session().send_message(text)
+        raise
+    except genai_errors.ClientError as e:
+        # If the configured model has quota=0, try a fallback model automatically.
+        lower = str(e).lower()
+        if "resource_exhausted" in lower and "limit: 0" in lower:
+            current = _model_name
+            global _last_fallback_attempts
+            _last_fallback_attempts = [current]
+            for candidate in _parse_fallback_models():
+                if candidate == current:
+                    continue
+                try:
+                    _last_fallback_attempts.append(candidate)
+                    _set_model_name(candidate, reason="fallback")
+                    _reset_chat_session()
+                    return _get_chat_session().send_message(text)
+                except genai_errors.ClientError:
+                    continue
+            # Restore original model if all fallbacks fail.
+            _set_model_name(current)
+            _reset_chat_session()
+        raise
 
 
 console = Console()
@@ -140,7 +214,7 @@ Please:
 4. Keep it under 3 lines per section"""
 
     try:
-        return _get_chat_session().send_message(prompt).text
+        return _send_message(prompt).text
     except Exception:
         return "My brain seems to be offline. Maybe try again? 🤖💤"
 
@@ -258,10 +332,51 @@ def _fr(response_text):
 
 def _gr(prompt):
     try:
-        _fr(_get_chat_session().send_message(prompt).text)
+        global _model_notice
+        if _model_notice:
+            console.print(f"[yellow]{_model_notice}[/yellow]")
+            _model_notice = None
+
+        _fr(_send_message(prompt).text)
     except SystemExit as e:
         console.print(f"[red]{e}[/red]")
         raise
+    except genai_errors.ClientError as e:
+        msg = str(e)
+        lower = msg.lower()
+        if "resource_exhausted" in lower or "quota" in lower or "rate" in lower:
+            if "limit: 0" in lower or "limit: 0," in lower:
+                console.print(
+                    "[red]Gemini quota appears to be 0 for this model/key.[/red]"
+                )
+                if _last_fallback_attempts:
+                    console.print(
+                        "[dim]Tried models: "
+                        + ", ".join(_last_fallback_attempts)
+                        + "[/dim]"
+                    )
+                console.print(
+                    "[dim]Fix: check billing/quota, or set a different model via $env:GEMINI_MODEL='...'.[/dim]"
+                )
+                console.print(
+                    "[dim]Optional: set fallbacks via $env:GEMINI_MODEL_FALLBACKS='model1,model2,...'[/dim]"
+                )
+                console.print(f"[dim]{msg}[/dim]")
+                return
+
+            m = re.search(r"retry in\s+([0-9.]+)s", lower)
+            if m:
+                delay = float(m.group(1))
+                delay = min(max(delay, 1.0), 30.0)
+                console.print(
+                    f"[yellow]Rate limited. Waiting {delay:.1f}s then retrying once...[/yellow]"
+                )
+                time.sleep(delay)
+                _fr(_send_message(prompt).text)
+                return
+
+        console.print("[red]Gemini API error[/red]")
+        console.print(f"[dim]{msg}[/dim]")
     except Exception as e:
         console.print("[red]My internet hamster fell off the wheel! 🐹[/red]")
         console.print(f"[dim]{type(e).__name__}: {e}[/dim]")
